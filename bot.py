@@ -9,7 +9,7 @@ import random
 import string
 from typing import Optional
 from aiohttp import web
-import openai
+import google.generativeai as genai
 import base64
 import tempfile
 from playwright.async_api import async_playwright
@@ -21,7 +21,7 @@ PROXY_PASSWORD = os.environ["PROXY_PASSWORD"]
 PROXY_HOST     = os.environ.get("PROXY_HOST", "p.webshare.io")
 PROXY_PORT     = int(os.environ.get("PROXY_PORT", "80"))
 PORT           = int(os.environ.get("PORT", "8080"))
-OPENAI_KEY  = os.environ["OPENAI_API_KEY"]
+GEMINI_KEY  = os.environ["GEMINI_API_KEY"]
 # ─────────────────────────────────────────────────────────────────────────────
 
 PROXY_URL  = f"http://{PROXY_HOST}:{PROXY_PORT}"
@@ -162,42 +162,29 @@ async def rolimons_verify_phrase(user_id: int) -> str | None:
         print(f"[playwright error] {e}")
         return None
 
-    # Send screenshot to GPT-4o mini vision
+    # Send screenshot to Gemini 1.5 Flash (free tier)
     try:
-        img_b64 = base64.standard_b64encode(screenshot_bytes).decode("utf-8")
-        client = openai.OpenAI(api_key=OPENAI_KEY)
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=60,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{img_b64}",
-                            "detail": "low",  # low detail = fewer tokens, enough for reading text
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "This is the Rolimons verification page. "
-                            "Find the verification phrase shown in the text box — it is 5-7 random words separated by spaces. "
-                            "Reply with ONLY the phrase, nothing else. If not visible, reply: NOT_FOUND"
-                        ),
-                    },
-                ],
-            }],
-        )
-        phrase = response.choices[0].message.content.strip()
+        genai.configure(api_key=GEMINI_KEY)
+        model = genai.GenerativeModel("gemini-3.1-flash-lite")
+        import PIL.Image
+        import io
+        img = PIL.Image.open(io.BytesIO(screenshot_bytes))
+        response = model.generate_content([
+            img,
+            (
+                "This is the Rolimons verification page. "
+                "Find the verification phrase shown in the text box — it is 5-7 random words separated by spaces. "
+                "Reply with ONLY the phrase, nothing else. If not visible, reply: NOT_FOUND"
+            ),
+        ])
+        phrase = response.text.strip()
         if phrase == "NOT_FOUND" or len(phrase) < 3:
             return None
         phrase = phrase.strip('"\'`')
-        print(f"[gpt-4o-mini] extracted phrase: {phrase}")
+        print(f"[gemini] extracted phrase: {phrase}")
         return phrase
     except Exception as e:
-        print(f"[openai vision error] {e}")
+        print(f"[gemini vision error] {e}")
         return None
 
 
