@@ -9,6 +9,10 @@ import random
 import string
 from typing import Optional
 from aiohttp import web
+import openai
+import base64
+import tempfile
+from playwright.async_api import async_playwright
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 DISCORD_TOKEN  = os.environ["DISCORD_TOKEN"]
@@ -17,6 +21,7 @@ PROXY_PASSWORD = os.environ["PROXY_PASSWORD"]
 PROXY_HOST     = os.environ.get("PROXY_HOST", "p.webshare.io")
 PROXY_PORT     = int(os.environ.get("PROXY_PORT", "80"))
 PORT           = int(os.environ.get("PORT", "8080"))
+OPENAI_KEY  = os.environ["OPENAI_API_KEY"]
 # ─────────────────────────────────────────────────────────────────────────────
 
 PROXY_URL  = f"http://{PROXY_HOST}:{PROXY_PORT}"
@@ -132,15 +137,68 @@ async def rolimons_player_info(session: aiohttp.ClientSession, user_id: int) -> 
     return await fetch(session, f"https://www.rolimons.com/api/playerinfo/{user_id}")
 
 
-async def rolimons_verify_phrase(session: aiohttp.ClientSession, user_id: int) -> str | None:
+async def rolimons_verify_phrase(user_id: int) -> str | None:
     """
-    Fetch the verification phrase Rolimons wants pasted into the user's bio.
-    Rolimons generates this at /api/verification/generate for a given user ID.
+    Screenshot the Rolimons /verifyme page for the given user ID,
+    then use Claude vision to extract the verification phrase.
     """
-    data = await fetch(session, f"https://www.rolimons.com/api/verification/generate/{user_id}")
-    if not data:
+    url = f"https://www.rolimons.com/verifyme/{user_id}"
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = await browser.new_page(
+                viewport={"width": 1280, "height": 900},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+            )
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            # Wait for the phrase box to appear
+            await page.wait_for_timeout(2000)
+            screenshot_bytes = await page.screenshot(full_page=False)
+            await browser.close()
+    except Exception as e:
+        print(f"[playwright error] {e}")
         return None
-    return data.get("phrase") or data.get("verification_phrase") or None
+
+    # Send screenshot to GPT-4o mini vision
+    try:
+        img_b64 = base64.standard_b64encode(screenshot_bytes).decode("utf-8")
+        client = openai.OpenAI(api_key=OPENAI_KEY)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=60,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{img_b64}",
+                            "detail": "low",  # low detail = fewer tokens, enough for reading text
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "This is the Rolimons verification page. "
+                            "Find the verification phrase shown in the text box — it is 5-7 random words separated by spaces. "
+                            "Reply with ONLY the phrase, nothing else. If not visible, reply: NOT_FOUND"
+                        ),
+                    },
+                ],
+            }],
+        )
+        phrase = response.choices[0].message.content.strip()
+        if phrase == "NOT_FOUND" or len(phrase) < 3:
+            return None
+        phrase = phrase.strip('"\'`')
+        print(f"[gpt-4o-mini] extracted phrase: {phrase}")
+        return phrase
+    except Exception as e:
+        print(f"[openai vision error] {e}")
+        return None
 
 
 async def check_rolimons_verified(session: aiohttp.ClientSession, user_id: int, phrase: str) -> bool:
@@ -332,7 +390,7 @@ async def verify(interaction: discord.Interaction, roblox_username: str):
         roblox_name = user["name"]
 
         # 2. Get verification phrase from Rolimons
-        phrase = await rolimons_verify_phrase(session, roblox_id)
+        phrase = await rolimons_verify_phrase(roblox_id)
 
         # Fallback: Rolimons may not have a generate endpoint publicly;
         # in that case we guide the user to the Rolimons site manually.
