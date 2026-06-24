@@ -24,10 +24,9 @@ PORT           = int(os.environ.get("PORT", "8080"))
 GEMINI_KEY  = os.environ["GEMINI_API_KEY"]
 # ─────────────────────────────────────────────────────────────────────────────
 
-PROXY_URL = f"http://{PROXY_HOST}:{PROXY_PORT}"
-PROXY_HEADERS = {
-    "Proxy-Authorization": aiohttp.BasicAuth(PROXY_USERNAME, PROXY_PASSWORD).encode()
-}
+PROXY_URL  = f"http://{PROXY_HOST}:{PROXY_PORT}"
+_creds = base64.b64encode(f"{PROXY_USERNAME}:{PROXY_PASSWORD}".encode()).decode()
+PROXY_HEADERS = {"Proxy-Authorization": f"Basic {_creds}"}
 
 DEMAND_LABELS = {-1: "Unassigned", 0: "Terrible", 1: "Low", 2: "Normal", 3: "High", 4: "Amazing"}
 TREND_LABELS  = {-1: "Unassigned", 0: "Lowering", 1: "Unstable", 2: "Stable", 3: "Raising", 4: "Fluctuating"}
@@ -38,10 +37,6 @@ verified_users: dict[int, dict] = {}
 
 # pending_verifications: { discord_user_id (int) -> { roblox_id, roblox_name, phrase } }
 pending_verifications: dict[int, dict] = {}
-
-# rolimons_sessions: { discord_user_id (int) -> { playwright, browser, page } }
-# Kept alive between fetching the phrase and clicking "Complete Profile Verification"
-rolimons_sessions: dict[int, dict] = {}
 
 # trade_ad_tasks: { discord_user_id (int) -> asyncio.Task }
 trade_ad_tasks: dict[int, asyncio.Task] = {}
@@ -91,7 +86,7 @@ async def fetch(
         kwargs = {"headers": h, "timeout": aiohttp.ClientTimeout(total=20)}
         if with_proxy and proxy_url:
             kwargs["proxy"] = proxy_url
-            kwargs["proxy_headers"] = PROXY_HEADERS
+            kwargs["proxy_auth"] = PROXY_AUTH
         try:
             async with session.get(url, **kwargs) as resp:
                 label = "proxy" if with_proxy else "direct"
@@ -143,99 +138,81 @@ async def rolimons_player_info(session: aiohttp.ClientSession, user_id: int) -> 
     return await fetch(session, f"https://www.rolimons.com/api/playerinfo/{user_id}")
 
 
-async def rolimons_open_verification(discord_user_id: int, roblox_username: str, roblox_id: int) -> str | None:
+async def rolimons_verify_phrase(user_id: int) -> str | None:
     """
-    Opens rolimons.com/verify, searches for the player, clicks their card,
-    selects the "Verify On Profile" method, and reads the phrase. Keeps the
-    browser session OPEN (stored in rolimons_sessions) so we can finish the
-    verification later once the person confirms they've pasted the phrase
-    into their Roblox bio.
+    Primary: use Playwright to read #verification_phrase_textbox directly.
+    Fallback: screenshot + Gemini vision if element not found.
     """
+    url = f"https://www.rolimons.com/verifyme/{user_id}"
+    screenshot_bytes = None
     try:
-        pw = await async_playwright().start()
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-        )
-        page = await browser.new_page(
-            viewport={"width": 1280, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-        )
-        await page.goto("https://www.rolimons.com/verify", wait_until="networkidle", timeout=30000)
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = await browser.new_page(
+                viewport={"width": 1280, "height": 900},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+            )
+            await page.goto(url, wait_until="networkidle", timeout=30000)
 
-        search_box = page.locator("#player_search_textbox")
-        await search_box.click()
-        await search_box.type(roblox_username, delay=60)
+            # ── Primary: grab text directly from the known textarea ──
+            try:
+                await page.wait_for_selector("#verification_phrase_textbox", timeout=8000)
+                phrase = await page.input_value("#verification_phrase_textbox")
+                await browser.close()
+                phrase = phrase.strip()
+                if phrase and len(phrase) > 3:
+                    print(f"[playwright direct] {phrase}")
+                    return phrase
+            except Exception as e:
+                print(f"[playwright selector miss] {e}")
 
-        card_selector = f'div.mix_item[data-player-id="{roblox_id}"]'
-        try:
-            await page.wait_for_selector(card_selector, timeout=8000)
-        except Exception:
-            # Fall back to whatever the top result is if exact ID match doesn't show
-            card_selector = "div.mix_item"
-            await page.wait_for_selector(card_selector, timeout=8000)
-        await page.click(card_selector)
-
-        # ⚠️ GUESS — the "Verify On Profile" method-select button doesn't have
-        # a confirmed id yet. This matches on visible text. If it clicks the
-        # wrong element, send the debug console dump for that button and
-        # swap this for an id/class selector.
-        try:
-            method_btn = page.get_by_text("Verify On Profile", exact=False).first
-            await method_btn.click(timeout=5000)
-        except Exception as e:
-            print(f"[verify-on-profile select miss] {e}")
-            # Continue anyway — some flows may default straight to the phrase step
-
-        await page.wait_for_selector("#verification_phrase_textbox", timeout=10000)
-        phrase = (await page.input_value("#verification_phrase_textbox")).strip()
-
-        if not phrase or len(phrase) <= 3:
+            # ── Fallback: take screenshot for Gemini ──
+            screenshot_bytes = await page.screenshot(full_page=False)
             await browser.close()
-            await pw.stop()
-            return None
-
-        rolimons_sessions[discord_user_id] = {"playwright": pw, "browser": browser, "page": page}
-        print(f"[playwright direct] {phrase}")
-        return phrase
 
     except Exception as e:
         print(f"[playwright error] {e}")
         return None
 
+    # ── Gemini vision fallback ──
+    if screenshot_bytes:
+        try:
+            import PIL.Image, io
+            client = genai.Client(api_key=GEMINI_KEY)
+            img = PIL.Image.open(io.BytesIO(screenshot_bytes))
+            response = client.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=[
+                    img,
+                    (
+                        "This is the Rolimons verification page. "
+                        "Find the verification phrase in the text box — 5-7 random words separated by spaces. "
+                        "Reply with ONLY the phrase. If not visible, reply: NOT_FOUND"
+                    ),
+                ],
+            )
+            phrase = response.text.strip().strip('"\'`')
+            if phrase and phrase != "NOT_FOUND" and len(phrase) > 3:
+                print(f"[gemini fallback] {phrase}")
+                return phrase
+        except Exception as e:
+            print(f"[gemini fallback error] {e}")
 
-async def rolimons_complete_verification(discord_user_id: int) -> bool:
+    return None
+
+
+async def check_rolimons_verified(session: aiohttp.ClientSession, user_id: int, phrase: str) -> bool:
     """
-    Uses the open session from rolimons_open_verification() to click
-    "Complete Profile Verification". Always cleans up the browser after,
-    whether it succeeds or fails.
+    Ask Rolimons to check if the phrase appears in the user's Roblox bio.
+    Uses Rolimons' verification check endpoint.
     """
-    session = rolimons_sessions.pop(discord_user_id, None)
-    if not session:
+    data = await fetch(session, f"https://www.rolimons.com/api/verification/check/{user_id}")
+    if not data:
         return False
-
-    page, browser, pw = session["page"], session["browser"], session["playwright"]
-
-    try:
-        await page.wait_for_selector("#complete_profile_verification_button", timeout=8000)
-        await page.click("#complete_profile_verification_button")
-        await page.wait_for_timeout(3000)
-
-        # ⚠️ GUESS — no confirmed success/failure element yet. This checks
-        # page text for common wording as a heuristic. Send the debug
-        # console dump for whatever appears right after clicking the button
-        # (success toast, error banner, etc.) and this can be swapped for an
-        # exact selector check.
-        content = (await page.content()).lower()
-        success = any(s in content for s in ["verified", "success", "you're verified", "linked"])
-        failure = any(s in content for s in ["not found", "couldn't verify", "phrase not found", "failed"])
-        return success and not failure
-    except Exception as e:
-        print(f"[complete verification error] {e}")
-        return False
-    finally:
-        await browser.close()
-        await pw.stop()
+    return data.get("verified", False) or data.get("success", False)
 
 
 async def search_rolimons_item(session: aiohttp.ClientSession, item_name: str) -> dict | None:
@@ -365,16 +342,6 @@ class VerifyButton(discord.ui.View):
         super().__init__(timeout=300)  # 5 min to verify
         self.discord_user_id = discord_user_id
 
-    async def on_timeout(self):
-        # Clean up an abandoned browser session if they never clicked Verify
-        session = rolimons_sessions.pop(self.discord_user_id, None)
-        if session:
-            try:
-                await session["browser"].close()
-                await session["playwright"].stop()
-            except Exception:
-                pass
-
     @discord.ui.button(label="✅ I've pasted it — Verify me!", style=discord.ButtonStyle.success)
     async def verify_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.discord_user_id:
@@ -388,7 +355,8 @@ class VerifyButton(discord.ui.View):
 
         await interaction.response.defer(thinking=True)
 
-        verified = await rolimons_complete_verification(self.discord_user_id)
+        async with aiohttp.ClientSession() as session:
+            verified = await check_rolimons_verified(session, pending["roblox_id"], pending["phrase"])
 
         if verified:
             verified_users[self.discord_user_id] = {
@@ -424,18 +392,19 @@ async def verify(interaction: discord.Interaction, roblox_username: str):
         roblox_id   = user["id"]
         roblox_name = user["name"]
 
-    # 2. Open the Rolimons verify flow and grab the phrase (browser session
-    #    stays open until the person clicks the Verify button below)
-    phrase = await rolimons_open_verification(interaction.user.id, roblox_name, roblox_id)
+        # 2. Get verification phrase from Rolimons
+        phrase = await rolimons_verify_phrase(roblox_id)
 
-    if not phrase:
-        await interaction.followup.send(
-            f"⚠️ Couldn't auto-fetch the phrase from Rolimons.\n"
-            f"Go to **https://www.rolimons.com/verify** manually, search for your account, copy the phrase, "
-            f"paste it in your Roblox bio, then run `/verify` again.",
-            ephemeral=True,
-        )
-        return
+        # Fallback: Rolimons may not have a generate endpoint publicly;
+        # in that case we guide the user to the Rolimons site manually.
+        if not phrase:
+            await interaction.followup.send(
+                f"⚠️ Couldn't auto-fetch the phrase from Rolimons.\n"
+                f"Go to **https://www.rolimons.com/verifyme** manually, copy the phrase, "
+                f"paste it in your Roblox bio, then run `/verify` again.",
+                ephemeral=True,
+            )
+            return
 
     # 3. Store pending
     pending_verifications[interaction.user.id] = {
