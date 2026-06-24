@@ -139,10 +139,11 @@ async def rolimons_player_info(session: aiohttp.ClientSession, user_id: int) -> 
 
 async def rolimons_verify_phrase(user_id: int) -> str | None:
     """
-    Screenshot the Rolimons /verifyme page for the given user ID,
-    then use Claude vision to extract the verification phrase.
+    Primary: use Playwright to read #verification_phrase_textbox directly.
+    Fallback: screenshot + Gemini vision if element not found.
     """
     url = f"https://www.rolimons.com/verifyme/{user_id}"
+    screenshot_bytes = None
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
@@ -154,40 +155,52 @@ async def rolimons_verify_phrase(user_id: int) -> str | None:
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
             )
             await page.goto(url, wait_until="networkidle", timeout=30000)
-            # Wait for the phrase box to appear
-            await page.wait_for_timeout(2000)
+
+            # ── Primary: grab text directly from the known textarea ──
+            try:
+                await page.wait_for_selector("#verification_phrase_textbox", timeout=8000)
+                phrase = await page.input_value("#verification_phrase_textbox")
+                await browser.close()
+                phrase = phrase.strip()
+                if phrase and len(phrase) > 3:
+                    print(f"[playwright direct] {phrase}")
+                    return phrase
+            except Exception as e:
+                print(f"[playwright selector miss] {e}")
+
+            # ── Fallback: take screenshot for Gemini ──
             screenshot_bytes = await page.screenshot(full_page=False)
             await browser.close()
+
     except Exception as e:
         print(f"[playwright error] {e}")
         return None
 
-    # Send screenshot to Gemini 1.5 Flash (free tier)
-    try:
-        import PIL.Image
-        import io
-        client = genai.Client(api_key=GEMINI_KEY)
-        img = PIL.Image.open(io.BytesIO(screenshot_bytes))
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=[
-                img,
-                (
-                    "This is the Rolimons verification page. "
-                    "Find the verification phrase shown in the text box — it is 5-7 random words separated by spaces. "
-                    "Reply with ONLY the phrase, nothing else. If not visible, reply: NOT_FOUND"
-                ),
-            ],
-        )
-        phrase = response.text.strip()
-        if phrase == "NOT_FOUND" or len(phrase) < 3:
-            return None
-        phrase = phrase.strip('"\'`')
-        print(f"[gemini] extracted phrase: {phrase}")
-        return phrase
-    except Exception as e:
-        print(f"[gemini vision error] {e}")
-        return None
+    # ── Gemini vision fallback ──
+    if screenshot_bytes:
+        try:
+            import PIL.Image, io
+            client = genai.Client(api_key=GEMINI_KEY)
+            img = PIL.Image.open(io.BytesIO(screenshot_bytes))
+            response = client.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=[
+                    img,
+                    (
+                        "This is the Rolimons verification page. "
+                        "Find the verification phrase in the text box — 5-7 random words separated by spaces. "
+                        "Reply with ONLY the phrase. If not visible, reply: NOT_FOUND"
+                    ),
+                ],
+            )
+            phrase = response.text.strip().strip('"\'`')
+            if phrase and phrase != "NOT_FOUND" and len(phrase) > 3:
+                print(f"[gemini fallback] {phrase}")
+                return phrase
+        except Exception as e:
+            print(f"[gemini fallback error] {e}")
+
+    return None
 
 
 async def check_rolimons_verified(session: aiohttp.ClientSession, user_id: int, phrase: str) -> bool:
