@@ -151,6 +151,7 @@ async def rolimons_open_verification(discord_user_id: int, roblox_username: str,
     pw = None
     browser = None
     try:
+        print(f"[debug] step 1 — launching browser")
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(
             headless=True,
@@ -161,42 +162,53 @@ async def rolimons_open_verification(discord_user_id: int, roblox_username: str,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
         )
 
-        # 1. Open verify page
+        print(f"[debug] step 2 — navigating to rolimons.com/verify")
         await page.goto("https://www.rolimons.com/verify", wait_until="networkidle", timeout=30000)
+        print(f"[debug] step 2 done — url: {page.url}")
 
-        # 2. Search for player (confirmed id: player_search_textbox)
+        print(f"[debug] step 3 — waiting for #player_search_textbox")
         await page.wait_for_selector("#player_search_textbox", timeout=10000)
         await page.click("#player_search_textbox")
         await page.type("#player_search_textbox", roblox_username, delay=80)
+        print(f"[debug] step 3 done — typed: {roblox_username}")
 
-        # 3. Click player card (confirmed: data-player-id attribute)
         card = f'[data-player-id="{roblox_id}"]'
+        print(f"[debug] step 4 — waiting for card: {card}")
         await page.wait_for_selector(card, timeout=10000)
         await page.click(card)
+        print(f"[debug] step 4 done — clicked player card")
 
-        # 4. Click "Verify On Profile" (confirmed button text from inspect)
+        print(f"[debug] step 5 — waiting for Verify On Profile button")
         await page.wait_for_timeout(1000)
         vbtn = page.get_by_text("Verify On Profile", exact=True).first
         await vbtn.wait_for(timeout=8000)
         await vbtn.click()
+        print(f"[debug] step 5 done — clicked Verify On Profile")
 
-        # 5. Read phrase from confirmed textarea (confirmed id: verification_phrase_textbox)
+        print(f"[debug] step 6 — waiting for #verification_phrase_textbox")
         await page.wait_for_selector("#verification_phrase_textbox", timeout=10000)
         await page.wait_for_timeout(500)
         phrase = (await page.input_value("#verification_phrase_textbox")).strip()
+        print(f"[debug] step 6 done — phrase: '{phrase}'")
 
         if not phrase or len(phrase) <= 3:
+            print(f"[debug] phrase empty or too short, aborting")
             await browser.close()
             await pw.stop()
             return None
 
-        # Store open session — needed to click Complete Profile Verification
         rolimons_sessions[discord_user_id] = {"pw": pw, "browser": browser, "page": page}
-        print(f"[rolimons] got phrase: {phrase}")
+        print(f"[debug] all steps done — phrase: {phrase}")
         return phrase
 
     except Exception as e:
-        print(f"[rolimons open error] {e}")
+        print(f"[rolimons open error] step failed: {type(e).__name__}: {e}")
+        # Dump page HTML snippet to help diagnose
+        try:
+            html_snippet = (await page.content())[:2000]
+            print(f"[debug] page HTML at failure:\n{html_snippet}")
+        except Exception:
+            pass
         try:
             if browser: await browser.close()
             if pw: await pw.stop()
