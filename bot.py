@@ -1,4 +1,9 @@
+import sys
+print(f"[startup] Python {sys.version}", flush=True)
+print(f"[startup] Starting imports...", flush=True)
+
 import discord
+print("[startup] discord imported", flush=True)
 from discord import app_commands
 from discord.ext import commands
 import aiohttp
@@ -9,12 +14,19 @@ import random
 import string
 from typing import Optional
 from aiohttp import web
+print("[startup] aiohttp imported", flush=True)
 from google import genai
+print("[startup] genai imported", flush=True)
 import base64
 import tempfile
 from playwright.async_api import async_playwright
+print("[startup] playwright imported", flush=True)
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
+print("[startup] checking env vars...", flush=True)
+_required = ["DISCORD_TOKEN", "PROXY_USERNAME", "PROXY_PASSWORD", "GEMINI_API_KEY"]
+for _v in _required:
+    print(f"[startup] {_v}: {'SET' if _v in os.environ else 'MISSING'}", flush=True)
 DISCORD_TOKEN  = os.environ["DISCORD_TOKEN"]
 PROXY_USERNAME = os.environ["PROXY_USERNAME"]
 PROXY_PASSWORD = os.environ["PROXY_PASSWORD"]
