@@ -9,7 +9,7 @@ import random
 import string
 from typing import Optional
 from aiohttp import web
-import google.generativeai as genai
+from google import genai
 import base64
 import tempfile
 from playwright.async_api import async_playwright
@@ -164,19 +164,21 @@ async def rolimons_verify_phrase(user_id: int) -> str | None:
 
     # Send screenshot to Gemini 1.5 Flash (free tier)
     try:
-        genai.configure(api_key=GEMINI_KEY)
-        model = genai.GenerativeModel("gemini-3.1-flash-lite")
         import PIL.Image
         import io
+        client = genai.Client(api_key=GEMINI_KEY)
         img = PIL.Image.open(io.BytesIO(screenshot_bytes))
-        response = model.generate_content([
-            img,
-            (
-                "This is the Rolimons verification page. "
-                "Find the verification phrase shown in the text box — it is 5-7 random words separated by spaces. "
-                "Reply with ONLY the phrase, nothing else. If not visible, reply: NOT_FOUND"
-            ),
-        ])
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=[
+                img,
+                (
+                    "This is the Rolimons verification page. "
+                    "Find the verification phrase shown in the text box — it is 5-7 random words separated by spaces. "
+                    "Reply with ONLY the phrase, nothing else. If not visible, reply: NOT_FOUND"
+                ),
+            ],
+        )
         phrase = response.text.strip()
         if phrase == "NOT_FOUND" or len(phrase) < 3:
             return None
