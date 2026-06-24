@@ -19,7 +19,8 @@ PROXY_PORT     = int(os.environ.get("PROXY_PORT", "80"))
 PORT           = int(os.environ.get("PORT", "8080"))
 # ─────────────────────────────────────────────────────────────────────────────
 
-PROXY_URL = f"http://{PROXY_USERNAME}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"
+PROXY_URL  = f"http://{PROXY_HOST}:{PROXY_PORT}"
+PROXY_AUTH = aiohttp.BasicAuth(PROXY_USERNAME, PROXY_PASSWORD)
 
 DEMAND_LABELS = {-1: "Unassigned", 0: "Terrible", 1: "Low", 2: "Normal", 3: "High", 4: "Amazing"}
 TREND_LABELS  = {-1: "Unassigned", 0: "Lowering", 1: "Unstable", 2: "Stable", 3: "Raising", 4: "Fluctuating"}
@@ -79,6 +80,7 @@ async def fetch(
         kwargs = {"headers": h, "timeout": aiohttp.ClientTimeout(total=20)}
         if with_proxy and proxy_url:
             kwargs["proxy"] = proxy_url
+            kwargs["proxy_auth"] = PROXY_AUTH
         try:
             async with session.get(url, **kwargs) as resp:
                 label = "proxy" if with_proxy else "direct"
@@ -109,6 +111,7 @@ async def roblox_user_by_name(session: aiohttp.ClientSession, username: str) -> 
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=aiohttp.ClientTimeout(total=15),
             proxy=PROXY_URL,
+            proxy_auth=PROXY_AUTH,
         ) as resp:
             if resp.status != 200:
                 return None
