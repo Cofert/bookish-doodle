@@ -169,21 +169,58 @@ async def rolimons_open_verification(discord_user_id: int, roblox_username: str,
         print(f"[debug] step 3 — waiting for #player_search_textbox")
         await page.wait_for_selector("#player_search_textbox", timeout=10000)
         await page.click("#player_search_textbox")
-        await page.type("#player_search_textbox", roblox_username, delay=80)
+        # Clear field first, then type slowly so the search JS picks it up
+        await page.fill("#player_search_textbox", "")
+        await page.type("#player_search_textbox", roblox_username, delay=120)
         print(f"[debug] step 3 done — typed: {roblox_username}")
+
+        # Wait for search results to populate
+        await page.wait_for_timeout(2500)
+        print(f"[debug] step 3b — dumping visible mix_items on page:")
+        cards_debug = await page.eval_on_selector_all(
+            "div.mix_item",
+            "els => els.map(e => e.getAttribute('data-player-id') + '|' + e.innerText.trim().slice(0,30))"
+        )
+        print(f"[debug] cards found: {cards_debug}")
 
         card = f'[data-player-id="{roblox_id}"]'
         print(f"[debug] step 4 — waiting for card: {card}")
-        await page.wait_for_selector(card, timeout=10000)
+        try:
+            await page.wait_for_selector(card, timeout=8000)
+        except Exception:
+            # Fallback: click the first available card
+            print(f"[debug] step 4 fallback — exact card not found, clicking first mix_item")
+            await page.wait_for_selector("div.mix_item", timeout=5000)
+            card = "div.mix_item"
         await page.click(card)
         print(f"[debug] step 4 done — clicked player card")
 
+        # Wait for the method selection step to appear
+        await page.wait_for_timeout(1500)
         print(f"[debug] step 5 — waiting for Verify On Profile button")
-        await page.wait_for_timeout(1000)
-        vbtn = page.get_by_text("Verify On Profile", exact=True).first
-        await vbtn.wait_for(timeout=8000)
-        await vbtn.click()
-        print(f"[debug] step 5 done — clicked Verify On Profile")
+        print(f"[debug] step 5 page url: {page.url}")
+
+        # Try multiple ways to find the button
+        try:
+            vbtn = page.get_by_text("Verify On Profile", exact=True).first
+            await vbtn.wait_for(timeout=6000)
+            await vbtn.click()
+            print(f"[debug] step 5 done — clicked via exact text")
+        except Exception as e1:
+            print(f"[debug] step 5 exact text failed: {e1}, trying partial text")
+            try:
+                vbtn = page.get_by_text("Verify On Profile", exact=False).first
+                await vbtn.wait_for(timeout=4000)
+                await vbtn.click()
+                print(f"[debug] step 5 done — clicked via partial text")
+            except Exception as e2:
+                print(f"[debug] step 5 partial text failed: {e2}, trying to dump all buttons")
+                btns = await page.eval_on_selector_all(
+                    "button, a, input[type=submit], .btn",
+                    "els => els.map(e => e.id + '|' + e.innerText.trim().slice(0,40))"
+                )
+                print(f"[debug] buttons on page: {btns}")
+                raise Exception(f"Could not find Verify On Profile button. Buttons: {btns}")
 
         print(f"[debug] step 6 — waiting for #verification_phrase_textbox")
         await page.wait_for_selector("#verification_phrase_textbox", timeout=10000)
@@ -441,7 +478,15 @@ async def verify(interaction: discord.Interaction, roblox_username: str):
     roblox_name = user["name"]
 
     # 2. Run the full Rolimons verify flow — browser stays open after this
-    phrase = await rolimons_open_verification(interaction.user.id, roblox_name, roblox_id)
+    # Hard 60s timeout so Discord interaction never expires silently
+    try:
+        phrase = await asyncio.wait_for(
+            rolimons_open_verification(interaction.user.id, roblox_name, roblox_id),
+            timeout=60
+        )
+    except asyncio.TimeoutError:
+        print(f"[verify timeout] rolimons_open_verification timed out for {roblox_name}")
+        phrase = None
 
     if not phrase:
         await interaction.followup.send(
