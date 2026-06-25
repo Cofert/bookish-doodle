@@ -737,8 +737,21 @@ async def on_ready():
 # ─── ENTRYPOINT ──────────────────────────────────────────────────────────────
 print("[startup] all module-level code done, starting main()", flush=True)
 async def main():
+    print("[main] starting health server...", flush=True)
     await start_health_server()
-    await bot.start(DISCORD_TOKEN)
+    print("[main] health server up, connecting to Discord...", flush=True)
+    try:
+        await bot.start(DISCORD_TOKEN)
+    except Exception as e:
+        print(f"[main] bot.start failed: {e}", flush=True)
+        raise
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("[main] interrupted", flush=True)
+    except Exception as e:
+        print(f"[main] fatal error: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
