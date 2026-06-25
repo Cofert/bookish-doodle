@@ -39,12 +39,15 @@ GEMINI_KEY  = os.environ["GEMINI_API_KEY"]
 PROXY_URL  = f"http://{PROXY_HOST}:{PROXY_PORT}"
 _creds = base64.b64encode(f"{PROXY_USERNAME}:{PROXY_PASSWORD}".encode()).decode()
 PROXY_HEADERS = {"Proxy-Authorization": f"Basic {_creds}"}
+print("[startup] proxy headers ok", flush=True)
 
+print("[startup] defining labels...", flush=True)
 DEMAND_LABELS = {-1: "Unassigned", 0: "Terrible", 1: "Low", 2: "Normal", 3: "High", 4: "Amazing"}
 TREND_LABELS  = {-1: "Unassigned", 0: "Lowering", 1: "Unstable", 2: "Stable", 3: "Raising", 4: "Fluctuating"}
 
 # ─── IN-MEMORY STORES ────────────────────────────────────────────────────────
 # verified_users: { discord_user_id (int) -> { roblox_id, roblox_name } }
+print("[startup] defining stores...", flush=True)
 verified_users: dict[int, dict] = {}
 
 # pending_verifications: { discord_user_id (int) -> { roblox_id, roblox_name, phrase } }
@@ -57,8 +60,10 @@ trade_ad_tasks: dict[int, asyncio.Task] = {}
 trade_ad_config: dict[int, dict] = {}
 
 # ─── DISCORD BOT ─────────────────────────────────────────────────────────────
+print("[startup] creating bot...", flush=True)
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
+print("[startup] bot created ok", flush=True)
 
 
 # ─── HEALTH SERVER ───────────────────────────────────────────────────────────
@@ -730,6 +735,7 @@ async def on_ready():
 
 
 # ─── ENTRYPOINT ──────────────────────────────────────────────────────────────
+print("[startup] all module-level code done, starting main()", flush=True)
 async def main():
     await start_health_server()
     await bot.start(DISCORD_TOKEN)
