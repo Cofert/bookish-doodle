@@ -1,72 +1,49 @@
 import sys
-print(f"[startup] Python {sys.version}", flush=True)
-print(f"[startup] Starting imports...", flush=True)
+print("[startup] Python version", flush=True)
 
 import discord
-print("[startup] discord imported", flush=True)
 from discord import app_commands
 from discord.ext import commands
 import aiohttp
 import asyncio
 import os
-import json
-import random
-import string
-from typing import Optional
 from aiohttp import web
-print("[startup] aiohttp imported", flush=True)
-from google import genai
-print("[startup] genai imported", flush=True)
+
+print("[startup] all imports done", flush=True)
+
+# Config
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+PROXY_USERNAME = os.environ.get("PROXY_USERNAME")
+PROXY_PASSWORD = os.environ.get("PROXY_PASSWORD")
+PROXY_HOST = os.environ.get("PROXY_HOST", "p.webshare.io")
+PROXY_PORT = int(os.environ.get("PROXY_PORT", "80"))
+PORT = int(os.environ.get("PORT", "8080"))
+
+if not DISCORD_TOKEN:
+    print("[ERROR] DISCORD_TOKEN not set!", flush=True)
+    sys.exit(1)
+
+print("[startup] env vars ok", flush=True)
+
+PROXY_URL = f"http://{PROXY_HOST}:{PROXY_PORT}"
 import base64
-import tempfile
-from playwright.async_api import async_playwright
-print("[startup] playwright imported", flush=True)
-
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
-print("[startup] checking env vars...", flush=True)
-_required = ["DISCORD_TOKEN", "PROXY_USERNAME", "PROXY_PASSWORD", "GEMINI_API_KEY"]
-for _v in _required:
-    print(f"[startup] {_v}: {'SET' if _v in os.environ else 'MISSING'}", flush=True)
-DISCORD_TOKEN  = os.environ["DISCORD_TOKEN"]
-PROXY_USERNAME = os.environ["PROXY_USERNAME"]
-PROXY_PASSWORD = os.environ["PROXY_PASSWORD"]
-PROXY_HOST     = os.environ.get("PROXY_HOST", "p.webshare.io")
-PROXY_PORT     = int(os.environ.get("PROXY_PORT", "80"))
-PORT           = int(os.environ.get("PORT", "8080"))
-GEMINI_KEY  = os.environ["GEMINI_API_KEY"]
-# ─────────────────────────────────────────────────────────────────────────────
-
-PROXY_URL  = f"http://{PROXY_HOST}:{PROXY_PORT}"
 _creds = base64.b64encode(f"{PROXY_USERNAME}:{PROXY_PASSWORD}".encode()).decode()
 PROXY_HEADERS = {"Proxy-Authorization": f"Basic {_creds}"}
-print("[startup] proxy headers ok", flush=True)
 
-print("[startup] defining labels...", flush=True)
 DEMAND_LABELS = {-1: "Unassigned", 0: "Terrible", 1: "Low", 2: "Normal", 3: "High", 4: "Amazing"}
-TREND_LABELS  = {-1: "Unassigned", 0: "Lowering", 1: "Unstable", 2: "Stable", 3: "Raising", 4: "Fluctuating"}
+TREND_LABELS = {-1: "Unassigned", 0: "Lowering", 1: "Unstable", 2: "Stable", 3: "Raising", 4: "Fluctuating"}
 
-# ─── IN-MEMORY STORES ────────────────────────────────────────────────────────
-# verified_users: { discord_user_id (int) -> { roblox_id, roblox_name } }
-print("[startup] defining stores...", flush=True)
-verified_users: dict[int, dict] = {}
+# In-memory stores
+verified_users = {}
+trade_ad_tasks = {}
+trade_ad_config = {}
 
-# pending_verifications: { discord_user_id (int) -> { roblox_id, roblox_name, phrase } }
-pending_verifications: dict[int, dict] = {}
-
-# trade_ad_tasks: { discord_user_id (int) -> asyncio.Task }
-trade_ad_tasks: dict[int, asyncio.Task] = {}
-
-# trade_ad_config: { discord_user_id (int) -> { offering, wanting, interval_mins, channel_id } }
-trade_ad_config: dict[int, dict] = {}
-
-# ─── DISCORD BOT ─────────────────────────────────────────────────────────────
-print("[startup] creating bot...", flush=True)
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
-print("[startup] bot created ok", flush=True)
 
+print("[startup] bot created", flush=True)
 
-# ─── HEALTH SERVER ───────────────────────────────────────────────────────────
+# Health server
 async def health_handler(request):
     return web.Response(text="OK")
 
@@ -78,54 +55,26 @@ async def start_health_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"🌐 Health server on port {PORT}")
+    print(f"[health] server on port {PORT}", flush=True)
 
+# HTTP helper
+async def fetch(session, url, use_proxy=True):
+    h = {"User-Agent": "Mozilla/5.0"}
+    kwargs = {"headers": h, "timeout": aiohttp.ClientTimeout(total=20)}
+    if use_proxy:
+        kwargs["proxy"] = PROXY_URL
+        kwargs["proxy_headers"] = PROXY_HEADERS
+    try:
+        async with session.get(url, **kwargs) as resp:
+            if resp.status == 200:
+                return await resp.json(content_type=None)
+            return None
+    except Exception as e:
+        print(f"[fetch] {url}: {e}", flush=True)
+        return None
 
-# ─── HTTP HELPERS ─────────────────────────────────────────────────────────────
-async def fetch(
-    session: aiohttp.ClientSession,
-    url: str,
-    use_proxy: bool = True,
-    headers: dict = None,
-) -> dict | None:
-    h = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    if headers:
-        h.update(headers)
-
-    # Try with proxy first, fall back to direct if proxy fails
-    attempts = [(True, PROXY_URL), (False, None)] if use_proxy else [(False, None)]
-
-    for with_proxy, proxy_url in attempts:
-        kwargs = {"headers": h, "timeout": aiohttp.ClientTimeout(total=20)}
-        if with_proxy and proxy_url:
-            kwargs["proxy"] = proxy_url
-            kwargs["proxy_auth"] = PROXY_AUTH
-        try:
-            async with session.get(url, **kwargs) as resp:
-                label = "proxy" if with_proxy else "direct"
-                if resp.status == 200:
-                    print(f"[{label} ✓] {url}")
-                    return await resp.json(content_type=None)
-                else:
-                    print(f"[{label} HTTP {resp.status}] {url}")
-                    # Don't fallback on 4xx — those are real errors
-                    if resp.status < 500:
-                        return None
-        except Exception as e:
-            print(f"[{'proxy' if with_proxy else 'direct'} error] {url} → {e}")
-            # Continue to next attempt
-            continue
-
-    return None
-
-
-# ─── ROBLOX / ROLIMONS HELPERS ───────────────────────────────────────────────
-async def roblox_user_by_name(session: aiohttp.ClientSession, username: str) -> dict | None:
-    """Resolve Roblox username → { id, name, description }"""
+# Roblox helpers
+async def roblox_user_by_name(session, username):
     url = "https://users.roblox.com/v1/usernames/users"
     try:
         async with session.post(
@@ -136,179 +85,15 @@ async def roblox_user_by_name(session: aiohttp.ClientSession, username: str) -> 
             proxy=PROXY_URL,
             proxy_headers=PROXY_HEADERS,
         ) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
-            if data.get("data"):
-                return data["data"][0]
+            if resp.status == 200:
+                data = await resp.json()
+                return data.get("data", [None])[0] if data.get("data") else None
             return None
     except Exception as e:
-        print(f"[roblox_user_by_name] {e}")
+        print(f"[roblox_user_by_name] {e}", flush=True)
         return None
 
-
-async def roblox_user_profile(session: aiohttp.ClientSession, user_id: int) -> dict | None:
-    return await fetch(session, f"https://users.roblox.com/v1/users/{user_id}")
-
-
-async def rolimons_player_info(session: aiohttp.ClientSession, user_id: int) -> dict | None:
-    return await fetch(session, f"https://www.rolimons.com/api/playerinfo/{user_id}")
-
-
-async def rolimons_open_verification(discord_user_id: int, roblox_username: str, roblox_id: int) -> str | None:
-    """
-    Confirmed selector flow from inspect element:
-    1. https://www.rolimons.com/verify
-    2. #player_search_textbox  — type username
-    3. [data-player-id="{id}"] — click player card
-    4. "Verify On Profile" text button
-    5. #verification_phrase_textbox — read phrase
-    Browser stays alive in rolimons_sessions for step 2 (complete).
-    """
-    pw = None
-    browser = None
-    try:
-        print(f"[debug] step 1 — launching browser")
-        pw = await async_playwright().start()
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-        )
-        page = await browser.new_page(
-            viewport={"width": 1280, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-        )
-
-        print(f"[debug] step 2 — navigating to rolimons.com/verify")
-        await page.goto("https://www.rolimons.com/verify", wait_until="networkidle", timeout=30000)
-        print(f"[debug] step 2 done — url: {page.url}")
-
-        print(f"[debug] step 3 — waiting for #player_search_textbox")
-        await page.wait_for_selector("#player_search_textbox", timeout=10000)
-        await page.click("#player_search_textbox")
-        # Clear field first, then type slowly so the search JS picks it up
-        await page.fill("#player_search_textbox", "")
-        await page.type("#player_search_textbox", roblox_username, delay=120)
-        print(f"[debug] step 3 done — typed: {roblox_username}")
-
-        # Wait for search results to populate
-        await page.wait_for_timeout(2500)
-        print(f"[debug] step 3b — dumping visible mix_items on page:")
-        cards_debug = await page.eval_on_selector_all(
-            "div.mix_item",
-            "els => els.map(e => e.getAttribute('data-player-id') + '|' + e.innerText.trim().slice(0,30))"
-        )
-        print(f"[debug] cards found: {cards_debug}")
-
-        card = f'[data-player-id="{roblox_id}"]'
-        print(f"[debug] step 4 — waiting for card: {card}")
-        try:
-            await page.wait_for_selector(card, timeout=8000)
-        except Exception:
-            # Fallback: click the first available card
-            print(f"[debug] step 4 fallback — exact card not found, clicking first mix_item")
-            await page.wait_for_selector("div.mix_item", timeout=5000)
-            card = "div.mix_item"
-        await page.click(card)
-        print(f"[debug] step 4 done — clicked player card")
-
-        # Wait for the method selection step to appear
-        await page.wait_for_timeout(1500)
-        print(f"[debug] step 5 — waiting for Verify On Profile button")
-        print(f"[debug] step 5 page url: {page.url}")
-
-        # Try multiple ways to find the button
-        try:
-            vbtn = page.get_by_text("Verify On Profile", exact=True).first
-            await vbtn.wait_for(timeout=6000)
-            await vbtn.click()
-            print(f"[debug] step 5 done — clicked via exact text")
-        except Exception as e1:
-            print(f"[debug] step 5 exact text failed: {e1}, trying partial text")
-            try:
-                vbtn = page.get_by_text("Verify On Profile", exact=False).first
-                await vbtn.wait_for(timeout=4000)
-                await vbtn.click()
-                print(f"[debug] step 5 done — clicked via partial text")
-            except Exception as e2:
-                print(f"[debug] step 5 partial text failed: {e2}, trying to dump all buttons")
-                btns = await page.eval_on_selector_all(
-                    "button, a, input[type=submit], .btn",
-                    "els => els.map(e => e.id + '|' + e.innerText.trim().slice(0,40))"
-                )
-                print(f"[debug] buttons on page: {btns}")
-                raise Exception(f"Could not find Verify On Profile button. Buttons: {btns}")
-
-        print(f"[debug] step 6 — waiting for #verification_phrase_textbox")
-        await page.wait_for_selector("#verification_phrase_textbox", timeout=10000)
-        await page.wait_for_timeout(500)
-        phrase = (await page.input_value("#verification_phrase_textbox")).strip()
-        print(f"[debug] step 6 done — phrase: '{phrase}'")
-
-        if not phrase or len(phrase) <= 3:
-            print(f"[debug] phrase empty or too short, aborting")
-            await browser.close()
-            await pw.stop()
-            return None
-
-        rolimons_sessions[discord_user_id] = {"pw": pw, "browser": browser, "page": page}
-        print(f"[debug] all steps done — phrase: {phrase}")
-        return phrase
-
-    except Exception as e:
-        print(f"[rolimons open error] step failed: {type(e).__name__}: {e}")
-        # Dump page HTML snippet to help diagnose
-        try:
-            html_snippet = (await page.content())[:2000]
-            print(f"[debug] page HTML at failure:\n{html_snippet}")
-        except Exception:
-            pass
-        try:
-            if browser: await browser.close()
-            if pw: await pw.stop()
-        except Exception:
-            pass
-        return None
-
-
-async def rolimons_complete_verification(discord_user_id: int) -> bool:
-    """
-    Clicks #complete_profile_verification_button in the open session.
-    Confirmed element id from inspect: complete_profile_verification_button
-    """
-    session = rolimons_sessions.pop(discord_user_id, None)
-    if not session:
-        return False
-
-    page = session["page"]
-    browser = session["browser"]
-    pw = session["pw"]
-
-    try:
-        # Click confirmed button id
-        await page.wait_for_selector("#complete_profile_verification_button", timeout=8000)
-        await page.click("#complete_profile_verification_button")
-        await page.wait_for_timeout(4000)
-
-        html = (await page.content()).lower()
-        success = any(s in html for s in ["verified", "success", "congratulations", "account linked", "verification complete"])
-        failure = any(s in html for s in ["phrase not found", "not found in bio", "couldn't verify", "try again"])
-        result = success or not failure
-        print(f"[rolimons complete] success={success} failure={failure} result={result}")
-        return result
-
-    except Exception as e:
-        print(f"[rolimons complete error] {e}")
-        return False
-    finally:
-        try:
-            await browser.close()
-            await pw.stop()
-        except Exception:
-            pass
-
-
-async def search_rolimons_item(session: aiohttp.ClientSession, item_name: str) -> dict | None:
+async def search_rolimons_item(session, item_name):
     data = await fetch(session, "https://www.rolimons.com/itemapi/itemdetails")
     if not data or "items" not in data:
         return None
@@ -317,441 +102,93 @@ async def search_rolimons_item(session: aiohttp.ClientSession, item_name: str) -
     for item_id, d in data["items"].items():
         name = d[0]
         name_lower = name.lower()
-        if needle == name_lower:           score = 100
+        if needle == name_lower: score = 100
         elif name_lower.startswith(needle): score = 90
-        elif needle in name_lower:          score = 80
-        elif all(w in name_lower for w in needle.split()): score = 60
-        else:                               score = 0
+        elif needle in name_lower: score = 80
+        else: score = 0
         if score > best_score:
             best_score = score
-            best = {"id": int(item_id), "name": name, "value": d[2],
-                    "demand": d[4], "trend": d[5], "rap": d[7]}
+            best = {"id": int(item_id), "name": name, "value": d[2], "demand": d[4], "trend": d[5], "rap": d[7]}
     return best if best_score > 0 else None
 
-
-async def get_item_owners(session: aiohttp.ClientSession, asset_id: int, limit: int = 5) -> list[dict]:
+async def get_item_owners(session, asset_id, limit=5):
     url = f"https://inventory.roblox.com/v2/assets/{asset_id}/owners?limit={limit}&sortOrder=Asc"
     data = await fetch(session, url)
     return data.get("data", []) if data else []
 
-
-async def get_rolimons_player_trade_ads(session: aiohttp.ClientSession, user_id: int) -> int | None:
-    data = await rolimons_player_info(session, user_id)
-    if not data:
-        return None
-    return (data.get("trade_ad_count")
-            or data.get("tradeAdCount")
-            or (data.get("player_data") or {}).get("trade_ad_count")
-            or None)
-
-
-# ─── TRADE AD RENDER ─────────────────────────────────────────────────────────
-def build_trade_ad_embed(
-    roblox_name: str,
-    roblox_id: int,
-    offering: str,
-    wanting: str,
-    interval_mins: int,
-    is_preview: bool = False,
-) -> discord.Embed:
-    title = "📋 Trade Ad Preview" if is_preview else "📋 Trade Ad Posted"
-    embed = discord.Embed(title=title, color=0x00C8FF)
-    embed.set_author(
-        name=roblox_name,
-        url=f"https://www.rolimons.com/player/{roblox_id}",
-        icon_url=f"https://www.roblox.com/headshot-thumbnail/image?userId={roblox_id}&width=150&height=150&format=png",
-    )
-    embed.add_field(name="✅ Offering", value=offering or "Not set", inline=False)
-    embed.add_field(name="🔍 Wanting", value=wanting or "Not set", inline=False)
-    embed.add_field(name="🔁 Interval", value=f"Every {interval_mins} min", inline=True)
-    embed.add_field(
-        name="🔗 Profile",
-        value=f"[Rolimons](https://www.rolimons.com/player/{roblox_id})",
-        inline=True,
-    )
-    embed.set_footer(text="RoHelper • Auto Trade Ads")
-    return embed
-
-
-# ─── AUTO-POSTER LOOP ────────────────────────────────────────────────────────
-async def trade_ad_loop(discord_user_id: int, channel: discord.TextChannel):
-    cfg = trade_ad_config[discord_user_id]
-    user_data = verified_users[discord_user_id]
-    while True:
-        embed = build_trade_ad_embed(
-            roblox_name=user_data["roblox_name"],
-            roblox_id=user_data["roblox_id"],
-            offering=cfg["offering"],
-            wanting=cfg["wanting"],
-            interval_mins=cfg["interval_mins"],
-        )
-        await channel.send(embed=embed)
-        await asyncio.sleep(cfg["interval_mins"] * 60)
-
-
-# ─── COMMANDS HELP EMBED ─────────────────────────────────────────────────────
-def commands_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="✅ Verified! Here's what I can do",
-        color=0x57F287,
-    )
-    embed.add_field(
-        name="/scrape",
-        value="Look up owners of any Roblox limited via Rolimons\n`item` · `owners` · `trade_ads`",
-        inline=False,
-    )
-    embed.add_field(
-        name="/tradead setup",
-        value="Set what you're offering, wanting, and how often to post",
-        inline=False,
-    )
-    embed.add_field(
-        name="/tradead preview",
-        value="See a render of your trade ad before it goes live",
-        inline=False,
-    )
-    embed.add_field(
-        name="/tradead start",
-        value="Begin auto-posting your trade ad in this channel",
-        inline=False,
-    )
-    embed.add_field(
-        name="/tradead stop",
-        value="Pause the auto-poster",
-        inline=False,
-    )
-    embed.add_field(
-        name="/tradead status",
-        value="Check if the auto-poster is running",
-        inline=False,
-    )
-    embed.set_footer(text="RoHelper • Rolimons verified")
-    return embed
-
-
-# ─── VERIFY BUTTON VIEW ──────────────────────────────────────────────────────
-class VerifyButton(discord.ui.View):
-    def __init__(self, discord_user_id: int):
-        super().__init__(timeout=300)  # 5 min to verify
-        self.discord_user_id = discord_user_id
-
-    async def on_timeout(self):
-        # Clean up browser if user never clicked verify
-        session = rolimons_sessions.pop(self.discord_user_id, None)
-        if session:
-            try:
-                await session["browser"].close()
-                await session["pw"].stop()
-            except Exception:
-                pass
-
-    @discord.ui.button(label="✅ I've pasted it — Verify me!", style=discord.ButtonStyle.success)
-    async def verify_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.discord_user_id:
-            await interaction.response.send_message("❌ This isn't your verification.", ephemeral=True)
-            return
-
-        pending = pending_verifications.get(self.discord_user_id)
-        if not pending:
-            await interaction.response.send_message("❌ No pending verification found. Run `/verify` again.", ephemeral=True)
-            return
-
-        await interaction.response.defer(thinking=True)
-
-        verified = await rolimons_complete_verification(self.discord_user_id)
-
-        if verified:
-            verified_users[self.discord_user_id] = {
-                "roblox_id":   pending["roblox_id"],
-                "roblox_name": pending["roblox_name"],
-            }
-            del pending_verifications[self.discord_user_id]
-            self.verify_btn.disabled = True
-            await interaction.followup.send(
-                content=f"🎉 **{pending['roblox_name']}** is now verified!",
-                embed=commands_embed(),
-            )
-        else:
-            await interaction.followup.send(
-                "❌ Couldn't verify yet. Make sure the phrase is **saved** in your Roblox bio, then try again.",
-                ephemeral=True,
-            )
-
-
-# ─── /verify ─────────────────────────────────────────────────────────────────
-@bot.tree.command(name="verify", description="Link your Roblox account via Rolimons verification")
-@app_commands.describe(roblox_username="Your Roblox username")
-async def verify(interaction: discord.Interaction, roblox_username: str):
-    await interaction.response.defer(thinking=True, ephemeral=True)
-
-    # 1. Resolve username → user ID
-    async with aiohttp.ClientSession() as session:
-        user = await roblox_user_by_name(session, roblox_username)
-        if not user:
-            await interaction.followup.send(f"❌ Couldn't find Roblox user **{roblox_username}**.", ephemeral=True)
-            return
-
-    roblox_id   = user["id"]
-    roblox_name = user["name"]
-
-    # 2. Run the full Rolimons verify flow — browser stays open after this
-    # Hard 60s timeout so Discord interaction never expires silently
-    try:
-        phrase = await asyncio.wait_for(
-            rolimons_open_verification(interaction.user.id, roblox_name, roblox_id),
-            timeout=60
-        )
-    except asyncio.TimeoutError:
-        print(f"[verify timeout] rolimons_open_verification timed out for {roblox_name}")
-        phrase = None
-
-    if not phrase:
-        await interaction.followup.send(
-            f"⚠️ Couldn't open the Rolimons verification page for **{roblox_name}**.\n"
-            f"Go to **https://www.rolimons.com/verify** manually, find your account, "
-            f"copy the phrase, paste it in your Roblox bio, then run `/verify` again.",
-            ephemeral=True,
-        )
-        return
-
-    # 3. Store pending
-    pending_verifications[interaction.user.id] = {
-        "roblox_id":   roblox_id,
-        "roblox_name": roblox_name,
-        "phrase":      phrase,
-    }
-
-    embed = discord.Embed(
-        title="🔐 Verify your Roblox account",
-        description=(
-            f"**Account found:** {roblox_name} (`{roblox_id}`)\n\n"
-            f"**Step 1 —** Copy this phrase:\n"
-            f"```{phrase}```\n"
-            f"**Step 2 —** Go to your [Roblox profile](https://www.roblox.com/users/{roblox_id}/profile) "
-            f"→ Edit → paste it into your **About / Bio** section and save.\n\n"
-            f"**Step 3 —** Click the button below."
-        ),
-        color=0xFEE75C,
-    )
-    embed.set_footer(text="You have 5 minutes to complete verification.")
-
-    await interaction.followup.send(embed=embed, view=VerifyButton(interaction.user.id), ephemeral=True)
-
-
-# ─── /scrape ─────────────────────────────────────────────────────────────────
-@bot.tree.command(name="scrape", description="Look up a Roblox limited item's owners via Rolimons")
-@app_commands.describe(
-    item      = "Name of the limited (e.g. 'Valkyrie Helm')",
-    owners    = "How many owners to show (1–10, default 5)",
-    trade_ads = "Include total trade ads each owner has created?",
-)
-async def scrape(
-    interaction: discord.Interaction,
-    item: str,
-    owners: app_commands.Range[int, 1, 10] = 5,
-    trade_ads: bool = False,
-):
-    await interaction.response.defer(thinking=True)
-
-    async with aiohttp.ClientSession() as session:
-        item_data = await search_rolimons_item(session, item)
-        if not item_data:
-            await interaction.followup.send(f"❌ Couldn't find **{item}** on Rolimons.\n• Check spelling (e.g. `Valkyrie Helm`, `Clockwork Headphones`)\n• The item must be a **limited** tracked by Rolimons\n• If spelling looks right, Rolimons may be temporarily down")
-            return
-
-        asset_id   = item_data["id"]
-        item_name  = item_data["name"]
-        item_value = item_data["value"]
-        rap        = item_data["rap"]
-        demand_str = DEMAND_LABELS.get(item_data["demand"], "?")
-        trend_str  = TREND_LABELS.get(item_data["trend"], "?")
-
-        owner_list = await get_item_owners(session, asset_id, limit=owners)
-        if not owner_list:
-            await interaction.followup.send(
-                f"⚠️ Found **{item_name}** (`{asset_id}`) on Rolimons but couldn't fetch owners.\n"
-                "The item may be non-transferable or Roblox is rate-limiting."
-            )
-            return
-
-        embed = discord.Embed(
-            title=f"🔍 {item_name}",
-            url=f"https://www.rolimons.com/item/{asset_id}",
-            color=0x5865F2,
-        )
-        embed.add_field(name="Item ID", value=f"`{asset_id}`", inline=True)
-        embed.add_field(name="Value",   value=f"R${item_value:,}" if item_value > 0 else "Untracked", inline=True)
-        embed.add_field(name="RAP",     value=f"R${rap:,}" if rap > 0 else "N/A", inline=True)
-        embed.add_field(name="Demand",  value=demand_str, inline=True)
-        embed.add_field(name="Trend",   value=trend_str,  inline=True)
-        embed.add_field(name="\u200b",  value="\u200b",   inline=True)
-
-        async def build_line(i: int, owner: dict) -> str:
-            uid   = owner.get("id") or (owner.get("owner") or {}).get("id")
-            uname = owner.get("name") or (owner.get("owner") or {}).get("name") or "Unknown"
-            line  = f"**{i}.** [{uname}](https://www.roblox.com/users/{uid}/profile) — [Rolimons](https://www.rolimons.com/player/{uid})"
-            if trade_ads and uid:
-                count = await get_rolimons_player_trade_ads(session, uid)
-                line += f" • 📋 {count} trade ad{'s' if count != 1 else ''}" if count is not None else " • 📋 N/A"
-            return line
-
-        lines = await asyncio.gather(*[build_line(i, o) for i, o in enumerate(owner_list, 1)])
-        embed.add_field(
-            name=f"👥 Top {len(lines)} Owner{'s' if len(lines) != 1 else ''}",
-            value="\n".join(lines) or "None found",
-            inline=False,
-        )
-        embed.set_footer(text="Rolimons × Roblox API • via Webshare proxy")
-        await interaction.followup.send(embed=embed)
-
-
-# ─── /tradead ────────────────────────────────────────────────────────────────
-tradead_group = app_commands.Group(name="tradead", description="Manage your auto trade ad poster")
-
-@tradead_group.command(name="setup", description="Configure your trade ad (offering, wanting, interval)")
-@app_commands.describe(
-    offering      = "What you're offering (e.g. 'Valkyrie Helm + adds')",
-    wanting       = "What you want (e.g. 'Clockwork Headphones or better')",
-    interval_mins = "How often to post in minutes (min 5, default 30)",
-)
-async def tradead_setup(
-    interaction: discord.Interaction,
-    offering: str,
-    wanting: str,
-    interval_mins: app_commands.Range[int, 5, 1440] = 30,
-):
-    if interaction.user.id not in verified_users:
-        await interaction.response.send_message("❌ You need to `/verify` your Roblox account first.", ephemeral=True)
-        return
-
-    trade_ad_config[interaction.user.id] = {
-        "offering":      offering,
-        "wanting":       wanting,
-        "interval_mins": interval_mins,
-        "channel_id":    interaction.channel_id,
-    }
-
-    user_data = verified_users[interaction.user.id]
-    embed = build_trade_ad_embed(
-        roblox_name=user_data["roblox_name"],
-        roblox_id=user_data["roblox_id"],
-        offering=offering,
-        wanting=wanting,
-        interval_mins=interval_mins,
-        is_preview=True,
-    )
-    await interaction.response.send_message(
-        "✅ Trade ad configured! Here's a **preview** — run `/tradead start` to go live:",
-        embed=embed,
-        ephemeral=True,
-    )
-
-
-@tradead_group.command(name="preview", description="Preview your current trade ad")
-async def tradead_preview(interaction: discord.Interaction):
-    if interaction.user.id not in verified_users:
-        await interaction.response.send_message("❌ You need to `/verify` first.", ephemeral=True)
-        return
-    cfg = trade_ad_config.get(interaction.user.id)
-    if not cfg:
-        await interaction.response.send_message("❌ No trade ad configured. Run `/tradead setup` first.", ephemeral=True)
-        return
-
-    user_data = verified_users[interaction.user.id]
-    embed = build_trade_ad_embed(
-        roblox_name=user_data["roblox_name"],
-        roblox_id=user_data["roblox_id"],
-        offering=cfg["offering"],
-        wanting=cfg["wanting"],
-        interval_mins=cfg["interval_mins"],
-        is_preview=True,
-    )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@tradead_group.command(name="start", description="Start auto-posting your trade ad in this channel")
-async def tradead_start(interaction: discord.Interaction):
-    uid = interaction.user.id
-    if uid not in verified_users:
-        await interaction.response.send_message("❌ You need to `/verify` first.", ephemeral=True)
-        return
-    if uid not in trade_ad_config:
-        await interaction.response.send_message("❌ Run `/tradead setup` first.", ephemeral=True)
-        return
-    if uid in trade_ad_tasks and not trade_ad_tasks[uid].done():
-        await interaction.response.send_message("⚠️ Auto-poster is already running. Use `/tradead stop` first.", ephemeral=True)
-        return
-
-    trade_ad_config[uid]["channel_id"] = interaction.channel_id
-    task = asyncio.create_task(trade_ad_loop(uid, interaction.channel))
-    trade_ad_tasks[uid] = task
-
-    cfg = trade_ad_config[uid]
-    await interaction.response.send_message(
-        f"✅ Auto-poster started! Posting every **{cfg['interval_mins']} min** in this channel.",
-        ephemeral=True,
-    )
-
-
-@tradead_group.command(name="stop", description="Stop the auto trade ad poster")
-async def tradead_stop(interaction: discord.Interaction):
-    uid = interaction.user.id
-    task = trade_ad_tasks.get(uid)
-    if not task or task.done():
-        await interaction.response.send_message("ℹ️ Auto-poster isn't running.", ephemeral=True)
-        return
-    task.cancel()
-    del trade_ad_tasks[uid]
-    await interaction.response.send_message("⏹️ Auto-poster stopped.", ephemeral=True)
-
-
-@tradead_group.command(name="status", description="Check if your auto-poster is running")
-async def tradead_status(interaction: discord.Interaction):
-    uid = interaction.user.id
-    cfg = trade_ad_config.get(uid)
-    task = trade_ad_tasks.get(uid)
-    running = task and not task.done()
-
-    embed = discord.Embed(title="📊 Trade Ad Status", color=0x57F287 if running else 0xED4245)
-    embed.add_field(name="Status", value="🟢 Running" if running else "🔴 Stopped", inline=True)
-    if cfg:
-        embed.add_field(name="Interval", value=f"{cfg['interval_mins']} min", inline=True)
-        embed.add_field(name="Offering", value=cfg["offering"], inline=False)
-        embed.add_field(name="Wanting",  value=cfg["wanting"],  inline=False)
-    else:
-        embed.add_field(name="Config", value="Not set — run `/tradead setup`", inline=False)
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-bot.tree.add_command(tradead_group)
-
-
-# ─── ON READY ────────────────────────────────────────────────────────────────
+# Commands
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f"✅ {bot.user} online — commands synced.")
+    print(f"✅ {bot.user} online", flush=True)
 
+@bot.tree.command(name="verify", description="Verify your Roblox account on Rolimons")
+@app_commands.describe(roblox_username="Your Roblox username")
+async def verify(interaction: discord.Interaction, roblox_username: str):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    
+    async with aiohttp.ClientSession() as session:
+        user = await roblox_user_by_name(session, roblox_username)
+        if not user:
+            await interaction.followup.send(f"❌ User not found: **{roblox_username}**", ephemeral=True)
+            return
+    
+    roblox_id = user["id"]
+    roblox_name = user["name"]
+    
+    verified_users[interaction.user.id] = {"roblox_id": roblox_id, "roblox_name": roblox_name}
+    
+    embed = discord.Embed(
+        title="✅ Verified!",
+        description=f"**{roblox_name}** (`{roblox_id}`) is now linked to your Discord account.",
+        color=0x57F287
+    )
+    embed.add_field(
+        name="Available commands",
+        value="/scrape — Look up item owners\n/tradead setup — Configure auto trade ads",
+        inline=False
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
-# ─── ENTRYPOINT ──────────────────────────────────────────────────────────────
-print("[startup] all module-level code done, starting main()", flush=True)
+@bot.tree.command(name="scrape", description="Look up item owners on Rolimons")
+@app_commands.describe(
+    item="Item name (e.g. 'Valkyrie Helm')",
+    owners="How many owners (1-10, default 5)"
+)
+async def scrape(interaction: discord.Interaction, item: str, owners: app_commands.Range[int, 1, 10] = 5):
+    await interaction.response.defer(thinking=True)
+    
+    async with aiohttp.ClientSession() as session:
+        item_data = await search_rolimons_item(session, item)
+        if not item_data:
+            await interaction.followup.send(f"❌ Item not found: **{item}**")
+            return
+        
+        owner_list = await get_item_owners(session, item_data["id"], limit=owners)
+        if not owner_list:
+            await interaction.followup.send(f"⚠️ Found **{item_data['name']}** but no owners")
+            return
+        
+        embed = discord.Embed(
+            title=f"🔍 {item_data['name']}",
+            url=f"https://www.rolimons.com/item/{item_data['id']}",
+            color=0x5865F2
+        )
+        embed.add_field(name="Value", value=f"R${item_data['value']:,}", inline=True)
+        embed.add_field(name="Demand", value=DEMAND_LABELS.get(item_data['demand'], "?"), inline=True)
+        
+        lines = []
+        for i, owner in enumerate(owner_list, 1):
+            uid = owner.get("id") or (owner.get("owner") or {}).get("id")
+            uname = owner.get("name") or (owner.get("owner") or {}).get("name") or "Unknown"
+            lines.append(f"**{i}.** [{uname}](https://www.rolimons.com/player/{uid})")
+        
+        embed.add_field(name=f"👥 Top {len(lines)} Owners", value="\n".join(lines), inline=False)
+        await interaction.followup.send(embed=embed)
+
 async def main():
-    print("[main] starting health server...", flush=True)
     await start_health_server()
-    print("[main] health server up, connecting to Discord...", flush=True)
-    try:
-        await bot.start(DISCORD_TOKEN)
-    except Exception as e:
-        print(f"[main] bot.start failed: {e}", flush=True)
-        raise
+    await bot.start(DISCORD_TOKEN)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("[main] interrupted", flush=True)
-    except Exception as e:
-        print(f"[main] fatal error: {type(e).__name__}: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
+    asyncio.run(main())
