@@ -12,7 +12,7 @@ from aiohttp import web
 print("[startup] all imports done", flush=True)
 
 # Config
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+DISCORD_TOKEN = os.environ.get("_RoliVerification")
 PROXY_USERNAME = os.environ.get("PROXY_USERNAME")
 PROXY_PASSWORD = os.environ.get("PROXY_PASSWORD")
 PROXY_HOST = os.environ.get("PROXY_HOST", "p.webshare.io")
@@ -20,7 +20,7 @@ PROXY_PORT = int(os.environ.get("PROXY_PORT", "80"))
 PORT = int(os.environ.get("PORT", "8080"))
 
 if not DISCORD_TOKEN:
-    print("[ERROR] DISCORD_TOKEN not set!", flush=True)
+    print("[ERROR] _RoliVerification token not set!", flush=True)
     sys.exit(1)
 
 print("[startup] env vars ok", flush=True)
